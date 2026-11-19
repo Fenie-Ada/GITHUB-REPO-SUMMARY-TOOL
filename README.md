@@ -33,7 +33,7 @@ python -m pip install requests
 
 
 
-## Accounts with many repos
+## For accounts with many repos:
 - More than 20 repos: the tool tells you how many there are and asks if you want to proceed.
 - More than 40 repos: only the first 40 (newest first) are listed. 
 
