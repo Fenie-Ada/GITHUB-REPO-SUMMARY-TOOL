@@ -1,17 +1,50 @@
+import os
 import sys
 import requests
 from datetime import datetime
 
 URL = "https://api.github.com"
 
+TOKEN = os.environ.get("GITHUB_TOKEN")  # optional, read from your computer, not saved in the code
+HEADERS = {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
+
+# file types counted as programming languages
+LANGUAGE_FILES = {
+    ".py": "Python", ".html": "HTML", ".htm": "HTML", ".css": "CSS",
+    ".scss": "SCSS", ".sass": "Sass", ".less": "Less",
+    ".js": "JavaScript", ".jsx": "JavaScript", ".mjs": "JavaScript",
+    ".ts": "TypeScript", ".tsx": "TypeScript", ".vue": "Vue",
+    ".java": "Java", ".c": "C", ".cpp": "C++", ".cc": "C++", ".cs": "C#",
+    ".php": "PHP", ".sql": "SQL", ".go": "Go", ".rs": "Rust",
+    ".rb": "Ruby", ".kt": "Kotlin", ".swift": "Swift", ".dart": "Dart",
+    ".sh": "Shell", ".bash": "Shell", ".bat": "Batchfile", ".ps1": "PowerShell",
+    ".applescript": "AppleScript", ".scpt": "AppleScript",
+    ".r": "R", ".lua": "Lua", ".pl": "Perl", ".scala": "Scala",
+    ".ipynb": "Jupyter Notebook",
+}
+
+# file types that are not programming languages (shown when a repo has no code)
+OTHER_FILES = {
+    ".md": "Markdown", ".txt": "Text files", ".json": "JSON", ".csv": "CSV",
+    ".png": "Images", ".jpg": "Images", ".jpeg": "Images", ".pdf": "PDF",
+    ".docx": "Word documents", ".xlsx": "Excel files", ".pptx": "PowerPoint files",
+}
+
+# folders to ignore (installed packages / not your own code)
+SKIP_FOLDERS = ("node_modules/", "venv/", "__pycache__/")
+
+
 def format_date(timestamp):
-    # turns GitHub's "2024-05-12T10:30:00Z" into "12-05-2024"
     date = datetime.strptime(timestamp[:10], "%Y-%m-%d")
     return date.strftime("%d-%m-%Y")
 
 
+def last_pushed(repo):
+    # the date code was last pushed; "updated_at" also changes when someone stars the repo or edits settings
+    return repo["pushed_at"] or repo["created_at"]
+
+
 def get_repos(username):
-    # downloads all public repos for a user and returns a list, or None if the user doesn't exist
     repos = []
     page = 1
 
@@ -20,6 +53,7 @@ def get_repos(username):
         response = requests.get(
             url,
             params={"per_page": 100, "page": page},  # max 100 repos per page
+            headers=HEADERS,
             timeout=10,
         )
 
@@ -42,10 +76,13 @@ def get_repos(username):
     return repos
 
 
-def get_repo_languages(repo):
-    # returns a dict like {"Python": 12000, "HTML": 3000} (bytes of code per language)
-    response = requests.get(repo["languages_url"], timeout=10)
+def get_repo_files(repo):
+    # returns the list of files in the repo
+    url = f"{URL}/repos/{repo['full_name']}/git/trees/{repo['default_branch']}"
+    response = requests.get(url, params={"recursive": 1}, headers=HEADERS, timeout=10)
 
+    if response.status_code in (404, 409):
+        return None  # nothing has been uploaded to this repo yet
     if response.status_code == 403:
         raise RuntimeError(
             "GitHub rate limit reached (60 requests per hour without login). "
@@ -53,7 +90,44 @@ def get_repo_languages(repo):
         )
     response.raise_for_status()
 
-    return response.json()
+    tree = response.json()["tree"]
+    return [item for item in tree if item["type"] == "blob"]  # "blob" means a file
+
+
+def find_languages(files):
+    # works out the languages from the file names
+    languages = {}  # language -> total size of its files, in the order the files appear
+    others = []     # non-code files found, e.g. README, Markdown, Text files
+
+    for file in files:
+        path = file["path"]
+        if any(folder in path for folder in SKIP_FOLDERS):
+            continue  # ignore installed packages
+
+        name = path.split("/")[-1].lower()
+        extension = os.path.splitext(name)[1]
+
+        if extension in LANGUAGE_FILES:
+            language = LANGUAGE_FILES[extension]
+            languages[language] = languages.get(language, 0) + file["size"]
+        elif name.startswith("readme"):
+            if "README" not in others:
+                others.append("README")
+        elif extension in OTHER_FILES:
+            kind = OTHER_FILES[extension]
+            if kind not in others:
+                others.append(kind)
+        elif extension in OTHER_FILES:
+            kind = OTHER_FILES[extension]
+            if kind not in others:
+                others.append(kind)
+        else:
+            # a file type that is in neither list: show what it actually is
+            label = f"{extension} files" if extension else path.split("/")[-1]
+            if label not in others:
+                others.append(label)
+
+    return languages, others
 
 
 def count_languages(repos):
@@ -66,9 +140,8 @@ def count_languages(repos):
     return counts
 
 
-def build_report(username, repos):
+def build_report(username, repos, total=None):
     # returns the report as a list of text lines
-    # leave forks out (i.e. copies of other people's projects)
     own_repos = [repo for repo in repos if not repo["fork"]]
 
     # sorts repos from most stars to least stars and takes the first 5
@@ -79,29 +152,43 @@ def build_report(username, repos):
     sorted_languages = sorted(languages.items(), key=lambda item: item[1], reverse=True)
 
     # gets the most recently updated repo
-    latest = max(own_repos, key=lambda r: r["updated_at"]) if own_repos else None
+    latest = max(own_repos, key=last_pushed) if own_repos else None
 
     lines = []
     lines.append(f"\nGitHub Repo Summary for: {username}\n")
     lines.append("=" * 40)
 
-    # each public repo's summary
-    lines.append(f"Public repos (forks not included): {len(own_repos)}\n")
+    # each repo's summary
+    if total and total > len(own_repos):
+        lines.append(f"Public repos (forks not included): {total} (showing the first {len(own_repos)})\n")
+    else:
+        lines.append(f"Public repos (forks not included): {len(own_repos)}\n")
     if own_repos:
         for number, repo in enumerate(own_repos, start=1):
-            repo_languages = get_repo_languages(repo)
-            if repo_languages:
-                all_languages = ", ".join(repo_languages)
-                most_used = max(repo_languages, key=repo_languages.get)  # language with the most code
-            else:
-                all_languages = "Not specified"
-                most_used = "Not specified"
-
-            updated = format_date(repo["updated_at"])
+            updated = format_date(last_pushed(repo))
             lines.append(f"  {number}. {repo['name']}")
             lines.append(f"     Stars: {repo['stargazers_count']} | Last updated: {updated}")
-            lines.append(f"     Languages: {all_languages}")
-            lines.append(f"     Most used: {most_used}\n")
+
+            files = get_repo_files(repo)
+            if not files:
+                lines.append("     Language(s): This repo is empty")
+            else:
+                languages, others = find_languages(files)
+
+                # if the file names didn't reveal a language, use the one GitHub detected
+                if not languages and repo["language"]:
+                    languages = {repo["language"]: 0}
+
+                if languages:
+                    lines.append(f"     Language(s): {', '.join(languages)}")
+                    if len(languages) > 1:
+                        most_used = max(languages, key=languages.get)  # language with the most code
+                        lines.append(f"     Most used: {most_used}")
+                else:
+                    lines.append("     Language(s): None")
+                    if others:
+                        lines.append(f"     Contains: {', '.join(others)}")
+            lines.append("")
 
     else:
         lines.append("  (no repos yet)")
@@ -116,7 +203,7 @@ def build_report(username, repos):
         lines.append("  (no language data)\n")
     
 
-    # top 5 repos, from the one with the most stars
+    # outputs top 5 repos, from the one with the most stars
     lines.append("")
     lines.append("\nTop 5 repos by stars:")
     if top_repos:
@@ -129,7 +216,7 @@ def build_report(username, repos):
     # 4. last updated repo
     if latest:
         lines.append("")
-        lines.append(f"\nLast updated repo: {latest['name']} on {format_date(latest['updated_at'])}")
+        lines.append(f"\nLast updated repo: {latest['name']} on {format_date(last_pushed(latest))}")
 
     return lines
 
@@ -143,7 +230,7 @@ def save_report(lines, username):
 
 
 def yes_no(question):
-    # keeps asking until the user types y or n (capital Y or N also works)
+    # keeps asking until the user types y or n
     while True:
         answer = input(question).strip().lower()
         if answer == "y":
@@ -181,8 +268,26 @@ def main():
         print(f"'{username}' has no public repositories.")
         return
 
+     # accounts with many repos: ask first (forks are not included in the report)
+    own_repos = [repo for repo in repos if not repo["fork"]]
+    total = len(own_repos)
+
+    if total > 20:
+        message = f"\nThis account has {total} repos (forks not included)."
+        if total > 40:
+            message += " Only the first 40 will be listed."
+        print(message)
+        if not yes_no("Shall I proceed? (y/n): "):
+            print("No report was made.")
+            return
+
+    if total > 40:
+        own_repos.sort(key=last_pushed, reverse=True)  # newest first, like the repositories page
+        repos = own_repos[:40]
+
+    
     try:
-        report = build_report(username, repos)
+        report = build_report(username, repos, total)
     except requests.exceptions.RequestException:
         print("Could not reach GitHub. Check your internet connection and try again.")
         return
